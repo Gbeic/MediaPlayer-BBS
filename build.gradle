@@ -59,3 +59,14 @@ allprojects {
         withSourcesJar()
     }
 }
+
+/**
+ * 为外层 BBS++ 开发环境准备固定路径的 MediaPlayer 运行包。
+ * 固定文件名可以避免 MediaPlayer 版本号变化后外层联动脚本失效。
+ */
+tasks.register("prepareBbsplusplusDevRuntime", Copy) {
+    dependsOn project(":fabric").tasks.named("remapJar")
+    from project(":fabric").tasks.named("remapJar").flatMap { it.archiveFile }
+    into layout.buildDirectory.dir("dev-runtime")
+    rename { "MediaPlayer-dev.jar" }
+}

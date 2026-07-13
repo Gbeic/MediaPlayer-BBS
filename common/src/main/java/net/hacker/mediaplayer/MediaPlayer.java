@@ -6,10 +6,11 @@ import net.minecraft.world.entity.Entity;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.File;
-import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.lang.ref.Cleaner;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.function.BiFunction;
 
 public final class MediaPlayer {
@@ -26,6 +27,7 @@ public final class MediaPlayer {
             "avcodec-63.dll",
             "avformat-63.dll"
     };
+    private static Path nativeTempDir;
 
     static {
         boolean available = false;
@@ -70,16 +72,31 @@ public final class MediaPlayer {
     }
 
     private static void copyAndLoadNativeLibrary(String name) throws Exception {
-        var lib = System.getProperty("java.io.tmpdir") + File.separator + name;
-        try (InputStream in = MediaPlayer.class.getResourceAsStream("/" + name); var fo = new FileOutputStream(lib)) {
+        Path lib = getNativeTempDir().resolve(name);
+        try (InputStream in = MediaPlayer.class.getResourceAsStream("/" + name)) {
             if (in == null) {
                 throw new IllegalStateException("缺少 " + name + " 资源");
             }
 
-            fo.write(in.readAllBytes());
+            Files.copy(in, lib, StandardCopyOption.REPLACE_EXISTING);
         }
 
-        System.load(lib);
+        lib.toFile().deleteOnExit();
+        System.load(lib.toAbsolutePath().toString());
+    }
+
+    private static Path createNativeTempDir() throws Exception {
+        Path dir = Files.createTempDirectory("mediaplayer-bbs-" + ProcessHandle.current().pid() + "-");
+        dir.toFile().deleteOnExit();
+        return dir;
+    }
+
+    private static Path getNativeTempDir() throws Exception {
+        if (nativeTempDir == null) {
+            nativeTempDir = createNativeTempDir();
+        }
+
+        return nativeTempDir;
     }
 
     public static native void init(long proc);

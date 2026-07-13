@@ -126,4 +126,5 @@ avformat-63.dll
 avutil-61.dll
 swresample-7.dll
 swscale-10.dll
-mediaplayer.dll
+MediaPlayer.dll
+bbsplusplus-dev.gradle
