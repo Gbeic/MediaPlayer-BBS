@@ -39,6 +39,7 @@ int VideoDecoder::RegisterMethods(JNIEnv* env)
 	std::vector<JNINativeMethod> methods;
 	methods.emplace_back(JNIMethod("open", "(Ljava/lang/String;II)J", Open));
 	methods.emplace_back(JNIMethod("decode", "()V", (void(*)(JNIEnv*, jobject))Decode));
+	methods.emplace_back(JNIMethod("renderTimeNative", "(D)V", (void(*)(JNIEnv*, jobject, jdouble))RenderTime));
 	methods.emplace_back(JNIMethod("release", "(J)V", Release));
 	return env->RegisterNatives(env->FindClass("net/hacker/mediaplayer/VideoDecoder"), methods.data(), methods.size());
 }
@@ -48,7 +49,15 @@ VideoDecoder* VideoDecoder::Open(JNIEnv* env, jobject obj, const jstring path, c
 	try {
 		auto ptr = new VideoDecoder(toString(path), type, texture);
 		auto [num, den] = ptr->format->streams[ptr->index]->avg_frame_rate;
-		Object(obj).set("frameRate", den / (double)num);
+		Object object(obj);
+		if (num > 0 && den > 0) {
+			object.set("frameRate", den / (double)num);
+			object.set("framesPerSecond", num / (double)den);
+		}
+		object.set("width", ptr->context->width);
+		object.set("height", ptr->context->height);
+		object.set("duration", ptr->format->duration == AV_NOPTS_VALUE ? 0.0 : ptr->format->duration / (double)AV_TIME_BASE);
+		object.set("hasAudio", av_find_best_stream(ptr->format, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0) >= 0);
 		while (ptr->Decode() < 0)(void)0;
 		return ptr;
 	}
@@ -62,6 +71,11 @@ VideoDecoder* VideoDecoder::Open(JNIEnv* env, jobject obj, const jstring path, c
 void VideoDecoder::Decode(JNIEnv*, const jobject obj)
 {
 	GetPtr<VideoDecoder>(obj)->Decode();
+}
+
+void VideoDecoder::RenderTime(JNIEnv*, const jobject obj, const jdouble seconds)
+{
+	GetPtr<VideoDecoder>(obj)->RenderTime(seconds);
 }
 
 void VideoDecoder::Release(JNIEnv*, jclass, const jlong ptr)
@@ -156,4 +170,19 @@ start:
 		success = true;
 	}
 	return success ? 0 : result;
+}
+
+void VideoDecoder::RenderTime(double seconds)
+{
+	if (seconds < 0) seconds = 0;
+
+	AVStream* stream = format->streams[index];
+	int64_t timestamp = av_rescale_q((int64_t)(seconds * AV_TIME_BASE), AV_TIME_BASE_Q, stream->time_base);
+	if (av_seek_frame(format, index, timestamp, AVSEEK_FLAG_BACKWARD) >= 0) {
+		// 时间轴跳转后必须清空解码器缓存，否则会混入 seek 前的旧帧。
+		avcodec_flush_buffers(context);
+	}
+
+	// 第一版先 seek 到目标附近并解出一帧，后续再补“解到最接近目标时间”的精细策略。
+	while (Decode() < 0)(void)0;
 }

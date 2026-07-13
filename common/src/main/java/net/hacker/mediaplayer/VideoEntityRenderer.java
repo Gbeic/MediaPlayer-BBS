@@ -31,7 +31,7 @@ public class VideoEntityRenderer extends EntityRenderer<VideoEntity> {
 
     @Override
     public void render(VideoEntity entity, float entityYaw, float partialTicks, PoseStack poseStack, MultiBufferSource bufferSource, int packedLight) {
-        if (!entity.playing && entity.decoder != null) {
+        if (!entity.playing && entity.decoder != null && entity.decoder.audio != null && MediaPlayer.audioFactory != null) {
             entity.playing = true;
             var audioData = entity.decoder.audio.decode(true);
             Minecraft.getInstance().getSoundManager().play(MediaPlayer.audioFactory.apply(audioData, entity));

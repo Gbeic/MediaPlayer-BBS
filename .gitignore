@@ -121,3 +121,9 @@ run/
 docs/
 AGENTS.md
 .vscode/
+avcodec-63.dll
+avformat-63.dll
+avutil-61.dll
+swresample-7.dll
+swscale-10.dll
+mediaplayer.dll

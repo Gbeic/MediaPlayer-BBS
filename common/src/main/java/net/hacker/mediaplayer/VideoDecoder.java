@@ -12,14 +12,32 @@ public final class VideoDecoder implements AutoCloseable {
     private final long ptr;
     @NativeUsed
     private double frameRate;
+    @NativeUsed
+    private double framesPerSecond;
+    @NativeUsed
+    private int width;
+    @NativeUsed
+    private int height;
+    @NativeUsed
+    private double duration;
+    @NativeUsed
+    private boolean hasAudio;
     private final Cleaner.Cleanable cleaner;
     public final VideoFrame frame;
     public final AudioDecoder audio;
     private double lastTime;
     private double deltaTime;
+    private double lastTimelineSeconds = Double.NaN;
     private final Minecraft minecraft = Minecraft.getInstance();
+    private static boolean timelineNativeAvailable = true;
 
     public VideoDecoder(String path, DeviceType type) {
+        this(path, type, true);
+    }
+
+    public VideoDecoder(String path, DeviceType type, boolean enableAudio) {
+        MediaPlayer.requireNativeAvailable();
+
         if (path == null || path.isBlank()) {
             throw new IllegalArgumentException("Video path is null or blank");
         }
@@ -30,11 +48,12 @@ public final class VideoDecoder implements AutoCloseable {
         }
 
         AudioDecoder a = null;
-        try {
-            a = new AudioDecoder(path);
-        } catch (Throwable ignore) {
-            // 你可以打印 warning 日志以调试
-            MediaPlayer.LOGGER.warn("无法创建音频解码器: {}", path);
+        if (enableAudio) {
+            try {
+                a = new AudioDecoder(path);
+            } catch (Throwable ignore) {
+                MediaPlayer.LOGGER.warn("无法创建音频解码器: {}", path);
+            }
         }
         audio = a;
 
@@ -67,6 +86,30 @@ public final class VideoDecoder implements AutoCloseable {
         return frameRate;
     }
 
+    public double getFramesPerSecond() {
+        return framesPerSecond;
+    }
+
+    public int getVideoWidth() {
+        return width;
+    }
+
+    public int getVideoHeight() {
+        return height;
+    }
+
+    public double getDuration() {
+        return duration;
+    }
+
+    public boolean hasAudio() {
+        return hasAudio;
+    }
+
+    public int getTextureId() {
+        return frame.getId();
+    }
+
     public void fetch() {
         var currentTime = glfwGetTime();
         var frameInterval = currentTime - lastTime;
@@ -78,11 +121,34 @@ public final class VideoDecoder implements AutoCloseable {
         }
     }
 
+    public void renderTime(double seconds) {
+        var targetSeconds = Double.isFinite(seconds) ? Math.max(0.0, seconds) : 0.0;
+
+        if (timelineNativeAvailable) {
+            try {
+                renderTimeNative(targetSeconds);
+                lastTimelineSeconds = targetSeconds;
+                return;
+            } catch (UnsatisfiedLinkError e) {
+                timelineNativeAvailable = false;
+                MediaPlayer.LOGGER.warn("native 时间轴寻帧接口不可用，暂时退回连续解码路径");
+            }
+        }
+
+        if (Double.isNaN(lastTimelineSeconds) || targetSeconds >= lastTimelineSeconds) {
+            decode();
+        }
+
+        lastTimelineSeconds = targetSeconds;
+    }
+
     private native long open(String path, int texture, int type);
 
     private static native void release(long ptr);
 
     public native void decode();
+
+    private native void renderTimeNative(double seconds);
 
     public static VideoDecoder create(File file) {
         try {
@@ -96,6 +162,26 @@ public final class VideoDecoder implements AutoCloseable {
                 } catch (Throwable e2) {
                     try {
                         return new VideoDecoder(file.getAbsolutePath(), DeviceType.NONE);
+                    } catch (Throwable e3) {
+                        throw new RuntimeException(e3);
+                    }
+                }
+            }
+        }
+    }
+
+    public static VideoDecoder createTimeline(File file) {
+        try {
+            return new VideoDecoder(file.getAbsolutePath(), DeviceType.CUDA, false);
+        } catch (Throwable e) {
+            try {
+                return new VideoDecoder(file.getAbsolutePath(), DeviceType.D3D12VA, false);
+            } catch (Throwable e1) {
+                try {
+                    return new VideoDecoder(file.getAbsolutePath(), DeviceType.D3D11VA, false);
+                } catch (Throwable e2) {
+                    try {
+                        return new VideoDecoder(file.getAbsolutePath(), DeviceType.NONE, false);
                     } catch (Throwable e3) {
                         throw new RuntimeException(e3);
                     }

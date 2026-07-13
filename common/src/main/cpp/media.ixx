@@ -116,12 +116,14 @@ export namespace MediaPlayer
 		AVFrame* frame;
 
 		int Decode();
+		void RenderTime(double seconds);
 	public:
 		explicit VideoDecoder(const std::string& url, AVHWDeviceType type, GLuint tex);
 		~VideoDecoder();
 		static int RegisterMethods(JNIEnv* env);
 		static VideoDecoder* Open(JNIEnv* env, jobject obj, jstring path, GLuint texture, AVHWDeviceType type);
 		static void Decode(JNIEnv* env, jobject obj);
+		static void RenderTime(JNIEnv* env, jobject obj, jdouble seconds);
 		static void Release(JNIEnv*, jclass, jlong ptr);
 	};
 
