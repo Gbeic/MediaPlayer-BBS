@@ -34,26 +34,35 @@ jobs:
           method: network
           sub-packages: '["nvcc", "cudart", "visual_studio_integration"]'
 
-      - name: 缓存 vcpkg 静态依赖
-        uses: actions/cache@v4
+      - name: 恢复 vcpkg 静态依赖缓存
+        id: vcpkg-cache
+        uses: actions/cache/restore@v4
         with:
-          path: ${{ runner.temp }}/vcpkg-binary-cache
-          key: vcpkg-ffmpeg-static-md-${{ runner.os }}-2026-08-10
+          path: ${{ github.workspace }}/.vcpkg-binary-cache
+          key: vcpkg-ffmpeg-static-md-release-${{ runner.os }}-v2
 
       - name: 构建 FFmpeg LGPL 静态开发库
         shell: pwsh
         run: |
           $vcpkg = Join-Path $env:VCPKG_INSTALLATION_ROOT 'vcpkg.exe'
-          $binaryCache = Join-Path $env:RUNNER_TEMP 'vcpkg-binary-cache'
+          $binaryCache = Join-Path $env:GITHUB_WORKSPACE '.vcpkg-binary-cache'
           New-Item -ItemType Directory -Force -Path $binaryCache | Out-Null
           $env:VCPKG_BINARY_SOURCES = "clear;files,$binaryCache,readwrite"
-          & $vcpkg install 'ffmpeg[avcodec,avformat,nvcodec,swresample,swscale]:x64-windows-static-md' --clean-after-build
+          $overlayTriplets = Join-Path $env:GITHUB_WORKSPACE 'ci\vcpkg'
+          & $vcpkg install 'ffmpeg[avcodec,avformat,nvcodec,swresample,swscale]:x64-windows-static-md-release' --overlay-triplets $overlayTriplets --clean-after-build
           if ($LASTEXITCODE -ne 0) { throw "vcpkg 构建 FFmpeg 失败，退出码：$LASTEXITCODE" }
-          $ffmpegRoot = Join-Path $env:VCPKG_INSTALLATION_ROOT 'installed\x64-windows-static-md'
+          $ffmpegRoot = Join-Path $env:VCPKG_INSTALLATION_ROOT 'installed\x64-windows-static-md-release'
           if (-not (Test-Path -LiteralPath (Join-Path $ffmpegRoot 'lib\avcodec.lib'))) {
             throw 'FFmpeg 静态库没有生成。'
           }
           "FFMPEG_ROOT=$ffmpegRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: 保存 vcpkg 静态依赖缓存
+        if: ${{ steps.vcpkg-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.vcpkg-binary-cache
+          key: vcpkg-ffmpeg-static-md-release-${{ runner.os }}-v2
 
       - name: 下载 nv-codec-headers
         shell: pwsh
