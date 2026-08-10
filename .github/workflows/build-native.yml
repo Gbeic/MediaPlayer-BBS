@@ -56,6 +56,7 @@ jobs:
             throw 'FFmpeg 静态库没有生成。'
           }
           "FFMPEG_ROOT=$ffmpegRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "NV_CODEC_ROOT=$ffmpegRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: 保存 vcpkg 静态依赖缓存
         if: ${{ steps.vcpkg-cache.outputs.cache-hit != 'true' }}
@@ -63,17 +64,6 @@ jobs:
         with:
           path: ${{ github.workspace }}/.vcpkg-binary-cache
           key: vcpkg-ffmpeg-static-md-release-${{ runner.os }}-v2
-
-      - name: 下载 nv-codec-headers
-        shell: pwsh
-        run: |
-          $archive = Join-Path $env:RUNNER_TEMP 'nv-codec-headers.zip'
-          $root = Join-Path $env:RUNNER_TEMP 'nv-codec-headers'
-          Invoke-WebRequest -Uri 'https://github.com/FFmpeg/nv-codec-headers/archive/eddcea9.zip' -OutFile $archive
-          Expand-Archive -LiteralPath $archive -DestinationPath $root -Force
-          $headersRoot = Get-ChildItem -LiteralPath $root -Directory | Select-Object -First 1
-          if (-not $headersRoot) { throw 'nv-codec-headers 压缩包没有包含顶层目录。' }
-          "NV_CODEC_ROOT=$($headersRoot.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: 下载 Khronos OpenGL 头文件
         shell: pwsh
@@ -119,5 +109,13 @@ jobs:
         with:
           name: MediaPlayer-native-windows-x64
           path: ${{ runner.temp }}/MediaPlayer-native-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: 上传 native 调试符号
+        uses: actions/upload-artifact@v4
+        with:
+          name: MediaPlayer-native-symbols-windows-x64
+          path: ${{ github.workspace }}/build/native-full/MediaPlayer.pdb
           if-no-files-found: error
           retention-days: 14

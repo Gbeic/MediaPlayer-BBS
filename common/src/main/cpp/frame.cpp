@@ -2,6 +2,7 @@ module;
 #include <d3d11_4.h>
 #include <d3dcompiler.h>
 #include <ffnvcodec/dynlink_loader.h>
+#include <stdexcept>
 #include <jni.h>
 #include "jnipp.h"
 #include "gl.h"
@@ -149,22 +150,31 @@ void VideoFrame::UpdateCUDA(const AVFrame* frame)
 {
 	void* InitCUDA(void* array);
 	int RunCUDACompute(void* y, void* uv, void* output, void* stream, uint32_t width, uint32_t height, uint32_t stepY, uint32_t stepUV);
-	CUcontext _;
-	cuda->cuCtxPushCurrent(cu_ctx);
+	if (!cuda || !cu_ctx) return;
+	CUcontext previous{};
+	if (cuda->cuCtxPushCurrent(cu_ctx) != CUDA_SUCCESS) return;
+	bool mapped = false;
+	CUarray array{};
+	void* surface = nullptr;
 	if (!cu_res) {
 		glBindTexture(GL_TEXTURE_2D, hw_texture);
 		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, frame->width, frame->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-		CUarray array;
-		cuda->cuGraphicsGLRegisterImage(&cu_res, hw_texture, GL_TEXTURE_2D, CU_GRAPHICS_REGISTER_FLAGS_SURFACE_LDST);
-		cuda->cuGraphicsMapResources(1, &cu_res, stream);
-		cuda->cuGraphicsSubResourceGetMappedArray(&array, cu_res, 0, 0);
-		output = InitCUDA(array);
+		if (cuda->cuGraphicsGLRegisterImage(&cu_res, hw_texture, GL_TEXTURE_2D, CU_GRAPHICS_REGISTER_FLAGS_SURFACE_LDST) != CUDA_SUCCESS) goto cleanup;
 	}
-	RunCUDACompute(frame->data[0], frame->data[1], output, stream, frame->width, frame->height, frame->linesize[0], frame->linesize[1]);
-	cuda->cuCtxPopCurrent(&_);
+	if (cuda->cuGraphicsMapResources(1, &cu_res, stream) != CUDA_SUCCESS) goto cleanup;
+	mapped = true;
+	if (cuda->cuGraphicsSubResourceGetMappedArray(&array, cu_res, 0, 0) != CUDA_SUCCESS) goto cleanup;
+	surface = InitCUDA(array);
+	if (!surface) goto cleanup;
+	if (RunCUDACompute(frame->data[0], frame->data[1], surface, stream, frame->width, frame->height, frame->linesize[0], frame->linesize[1]) != 0) goto cleanup;
+
+cleanup:
+	if (surface) cudaDestroySurfaceObject(surface);
+	if (mapped) cuda->cuGraphicsUnmapResources(1, &cu_res, stream);
+	cuda->cuCtxPopCurrent(&previous);
 }
 
-VideoFrame::VideoFrame(const AVHWDeviceType type, const AVHWDeviceContext* hwctx, GLuint tex) : hwtype(type), hw_texture(tex), output(nullptr), cu_res(nullptr), TextureObject(nullptr), FenceValue(0), memory(0), SharedHandle(nullptr), hwaccel(false), init(false)
+VideoFrame::VideoFrame(const AVHWDeviceType type, const AVHWDeviceContext* hwctx, GLuint tex) : FenceEvent(nullptr), SharedHandle(nullptr), memory(0), FenceValue(0), DXNVDevice(nullptr), TextureObject(nullptr), cuda(nullptr), cu_ctx(nullptr), stream(nullptr), cu_res(nullptr), hw_texture(tex), hwtype(type), hwaccel(false), init(false)
 {
 	switch (type)
 	{
@@ -218,7 +228,9 @@ VideoFrame::VideoFrame(const AVHWDeviceType type, const AVHWDeviceContext* hwctx
 	}
 	case AV_HWDEVICE_TYPE_CUDA:
 	{
-		cuda_load_functions(&cuda, nullptr);
+		if (cuda_load_functions(&cuda, nullptr) != CUDA_SUCCESS || !cuda) {
+			throw std::runtime_error("CUDA driver functions unavailable");
+		}
 		auto va = (AVCUDADeviceContext*)hwctx->hwctx;
 		cu_ctx = va->cuda_ctx;
 		stream = va->stream;
@@ -245,10 +257,15 @@ VideoFrame::~VideoFrame()
 	}
 	if (cu_res)
 	{
-		cudaDestroySurfaceObject(output);
-		cuda->cuGraphicsUnmapResources(1, &cu_res, stream);
-		cuda->cuGraphicsUnregisterResource(cu_res);
+		if (cuda && cu_ctx) {
+			CUcontext previous{};
+			if (cuda->cuCtxPushCurrent(cu_ctx) == CUDA_SUCCESS) {
+				cuda->cuGraphicsUnregisterResource(cu_res);
+				cuda->cuCtxPopCurrent(&previous);
+			}
+		}
 	}
+	if (cuda) cuda_free_functions(&cuda);
 }
 
 void VideoFrame::Update(const AVFrame* frame, bool hwaccel)

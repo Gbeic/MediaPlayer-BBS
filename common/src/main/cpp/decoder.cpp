@@ -1,6 +1,9 @@
 module;
 #include <vector>
 #include <memory>
+#include <algorithm>
+#include <cmath>
+#include <stdexcept>
 #include <jni.h>
 #include "jnipp.h"
 extern "C" {
@@ -47,7 +50,7 @@ int VideoDecoder::RegisterMethods(JNIEnv* env)
 VideoDecoder* VideoDecoder::Open(JNIEnv* env, jobject obj, const jstring path, const GLuint texture, const AVHWDeviceType type)
 {
 	try {
-		auto ptr = new VideoDecoder(toString(path), type, texture);
+		auto ptr = std::make_unique<VideoDecoder>(toString(path), type, texture);
 		auto [num, den] = ptr->format->streams[ptr->index]->avg_frame_rate;
 		Object object(obj);
 		if (num > 0 && den > 0) {
@@ -58,8 +61,10 @@ VideoDecoder* VideoDecoder::Open(JNIEnv* env, jobject obj, const jstring path, c
 		object.set("height", ptr->context->height);
 		object.set("duration", ptr->format->duration == AV_NOPTS_VALUE ? 0.0 : ptr->format->duration / (double)AV_TIME_BASE);
 		object.set("hasAudio", av_find_best_stream(ptr->format, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0) >= 0);
-		while (ptr->Decode() < 0)(void)0;
-		return ptr;
+		for (int attempts = 0; attempts < 240; attempts++) {
+			if (ptr->Decode() >= 0) return ptr.release();
+		}
+		throw std::runtime_error("No video frame decoded while opening");
 	}
 	catch (...)
 	{
@@ -127,6 +132,8 @@ VideoDecoder::VideoDecoder(const std::string& url, const AVHWDeviceType hw_type,
 
 VideoDecoder::~VideoDecoder()
 {
+	// VideoFrame 可能仍持有硬件帧、CUDA 上下文或图形互操作资源，必须先释放。
+	vframe.reset();
 	av_frame_free(&frame);
 	av_packet_free(&packet);
 	avcodec_free_context(&context);
@@ -135,56 +142,93 @@ VideoDecoder::~VideoDecoder()
 
 int VideoDecoder::Decode()
 {
-start:
-	int ret = av_read_frame(format, packet);
-	if (ret != 0) {
-		char buf[256];
-		av_strerror(ret, buf, sizeof(buf));
-		av_packet_unref(packet);
-		return ret;
-	}
-
-	if (ret >= 0 && packet->stream_index != index) {
-		av_packet_unref(packet);
-		goto start;
-	}
-
-	int result = avcodec_send_packet(context, packet);
-	av_packet_unref(packet);
-	if (result < 0) {
-		av_log(nullptr, AV_LOG_ERROR, "Error submitting a packet for decoding\n");
-		goto start;
-	}
-
-	auto success = false;
-	while (result >= 0) {
-		result = avcodec_receive_frame(context, frame);
-		if (result == AVERROR_EOF || result == AVERROR(EAGAIN)) break;
-		if (result < 0) {
-			av_log(nullptr, AV_LOG_ERROR, "Error decoding frame\n");
-			av_frame_unref(frame);
-			break;
+	for (;;) {
+		int ret = av_read_frame(format, packet);
+		if (ret < 0) {
+			av_packet_unref(packet);
+			return ret;
 		}
-		vframe->Update(frame, context->hwaccel != nullptr);
-		av_frame_unref(frame);
-		success = true;
+
+		if (packet->stream_index != index) {
+			av_packet_unref(packet);
+			continue;
+		}
+
+		int result = avcodec_send_packet(context, packet);
+		av_packet_unref(packet);
+		if (result < 0 && result != AVERROR(EAGAIN)) {
+			av_log(nullptr, AV_LOG_ERROR, "Error submitting a packet for decoding\n");
+			continue;
+		}
+
+		bool success = false;
+		for (;;) {
+			result = avcodec_receive_frame(context, frame);
+			if (result == AVERROR_EOF || result == AVERROR(EAGAIN)) break;
+			if (result < 0) {
+				av_log(nullptr, AV_LOG_ERROR, "Error decoding frame\n");
+				av_frame_unref(frame);
+				break;
+			}
+
+			const auto timestamp = frame->best_effort_timestamp != AV_NOPTS_VALUE
+				? frame->best_effort_timestamp
+				: frame->pts;
+			if (timestamp != AV_NOPTS_VALUE) {
+				const auto stream = format->streams[index];
+				const auto startTimestamp = stream->start_time == AV_NOPTS_VALUE ? 0 : stream->start_time;
+				const auto decodedSeconds = (timestamp - startTimestamp) * av_q2d(stream->time_base);
+				if (std::isfinite(decodedSeconds)) {
+					currentFrameSeconds = decodedSeconds;
+					hasCurrentFrame = true;
+				}
+			}
+			vframe->Update(frame, context->hwaccel != nullptr);
+			av_frame_unref(frame);
+			success = true;
+		}
+		if (success) return 0;
 	}
-	return success ? 0 : result;
 }
 
 void VideoDecoder::RenderTime(double seconds)
 {
-	if (seconds < 0) seconds = 0;
+	if (!std::isfinite(seconds) || seconds < 0) seconds = 0;
 
 	AVStream* stream = format->streams[index];
-	int64_t timestamp = av_rescale_q((int64_t)(seconds * AV_TIME_BASE), AV_TIME_BASE_Q, stream->time_base);
-	if (av_seek_frame(format, index, timestamp, AVSEEK_FLAG_BACKWARD) >= 0) {
+	const auto frameDuration = stream->avg_frame_rate.num > 0 && stream->avg_frame_rate.den > 0
+		? av_q2d(av_inv_q(stream->avg_frame_rate))
+		: 1.0 / 60.0;
+	const auto seekThreshold = std::max(0.25, frameDuration * 8.0);
+	const auto frameTolerance = frameDuration * 0.5;
+	const bool needsSeek = !hasCurrentFrame
+		|| seconds < currentFrameSeconds - frameTolerance
+		|| seconds > currentFrameSeconds + seekThreshold;
+
+	if (needsSeek) {
+		const auto startTimestamp = stream->start_time == AV_NOPTS_VALUE ? 0 : stream->start_time;
+		const int64_t timestamp = startTimestamp
+			+ av_rescale_q((int64_t)(seconds * AV_TIME_BASE), AV_TIME_BASE_Q, stream->time_base);
+		if (av_seek_frame(format, index, timestamp, AVSEEK_FLAG_BACKWARD) < 0) return;
 		// 时间轴跳转后必须清空解码器缓存，否则会混入 seek 前的旧帧。
 		avcodec_flush_buffers(context);
+		hasCurrentFrame = false;
+
+		// seek 到关键帧后连续解码，直到纹理对应的帧真正到达目标时间。
+		for (int attempts = 0; attempts < 240; attempts++) {
+			const int result = Decode();
+			if (result == AVERROR_EOF) return;
+			if (hasCurrentFrame && currentFrameSeconds >= seconds - frameTolerance) return;
+		}
+		return;
 	}
 
-	// seek 后限制读取次数，避免视频末尾或损坏文件让主线程无限等待。
-	for (int attempts = 0; attempts < 120; attempts++) {
-		if (Decode() >= 0) return;
+	if (seconds <= currentFrameSeconds + frameTolerance) return;
+
+	// 正向播放时一个游戏 tick 可能跨越多帧，不能只消费一个 packet。
+	for (int attempts = 0; attempts < 240; attempts++) {
+		const int result = Decode();
+		if (result == AVERROR_EOF) return;
+		if (hasCurrentFrame && currentFrameSeconds >= seconds - frameTolerance) return;
 	}
 }

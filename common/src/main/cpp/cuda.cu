@@ -46,10 +46,10 @@ int RunCUDACompute(void* y, void* uv, void* output, void* stream, const uint32_t
 
 void* InitCUDA(void* array)
 {
-	cudaResourceDesc resDesc;
+	cudaResourceDesc resDesc{};
 	resDesc.resType = cudaResourceTypeArray;
 	resDesc.res.array.array = (cudaArray_t)array;
-	cudaSurfaceObject_t surface;
-	cudaCreateSurfaceObject(&surface, &resDesc);
+	cudaSurfaceObject_t surface{};
+	if (cudaCreateSurfaceObject(&surface, &resDesc) != cudaSuccess) return nullptr;
 	return (void*)surface;
 }

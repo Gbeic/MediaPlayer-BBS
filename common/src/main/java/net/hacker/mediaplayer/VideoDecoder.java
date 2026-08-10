@@ -31,6 +31,7 @@ public final class VideoDecoder implements AutoCloseable {
     private double lastDecodedTimelineSeconds = Double.NaN;
     private final Minecraft minecraft = Minecraft.getInstance();
     private static boolean timelineNativeAvailable = true;
+    private boolean closed;
 
     public VideoDecoder(String path, DeviceType type) {
         this(path, type, true);
@@ -73,9 +74,13 @@ public final class VideoDecoder implements AutoCloseable {
             }
             
             ptr = p;
-            cleaner = MediaPlayer.cleaner.register(this, () -> release(p));
+            cleaner = MediaPlayer.cleaner.register(this, () -> releaseOnMinecraftThread(minecraft, p, frame));
         } catch (UnsatisfiedLinkError e) {
+            closeFailedResources();
             throw new RuntimeException("Native method open() not found or incompatible", e);
+        } catch (RuntimeException | Error e) {
+            closeFailedResources();
+            throw e;
         }
 
         lastTime = glfwGetTime();
@@ -124,6 +129,20 @@ public final class VideoDecoder implements AutoCloseable {
 
     public void renderTime(double seconds) {
         var targetSeconds = Double.isFinite(seconds) ? Math.max(0.0, seconds) : 0.0;
+
+        if (timelineNativeAvailable) {
+            try {
+                // native 端按视频帧 PTS 连续解码，避免按游戏 tick 一次只推进一帧。
+                renderTimeNative(targetSeconds);
+                lastTimelineSeconds = targetSeconds;
+                lastDecodedTimelineSeconds = targetSeconds;
+                return;
+            } catch (UnsatisfiedLinkError e) {
+                timelineNativeAvailable = false;
+                MediaPlayer.LOGGER.warn("native 时间轴寻帧接口不可用，退回连续解码路径");
+            }
+        }
+
         var frameInterval = frameRate > 0.0 ? frameRate : 1.0 / 60.0;
         var maxContinuousGap = Math.max(0.25, frameInterval * 8.0);
         var firstFrame = Double.isNaN(lastDecodedTimelineSeconds);
@@ -207,6 +226,27 @@ public final class VideoDecoder implements AutoCloseable {
 
     @Override
     public void close() {
+        if (closed) return;
+        closed = true;
         if (cleaner != null) cleaner.clean();
+        if (audio != null) audio.close();
+    }
+
+    private void closeFailedResources() {
+        if (audio != null) audio.close();
+        frame.close();
+    }
+
+    private static void releaseOnMinecraftThread(Minecraft minecraft, long ptr, VideoFrame frame) {
+        Runnable cleanup = () -> {
+            release(ptr);
+            frame.close();
+        };
+
+        if (minecraft.isSameThread()) {
+            cleanup.run();
+        } else {
+            minecraft.execute(cleanup);
+        }
     }
 }

@@ -89,7 +89,6 @@ export namespace MediaPlayer
 		CUcontext cu_ctx;
 		CUstream stream;
 		CUgraphicsResource cu_res;
-		void* output;
 		GLuint hw_texture;
 		AVHWDeviceType hwtype;
 		bool hwaccel, init;
@@ -114,6 +113,8 @@ export namespace MediaPlayer
 		int index;
 		AVPacket* packet;
 		AVFrame* frame;
+		double currentFrameSeconds{};
+		bool hasCurrentFrame{};
 
 		int Decode();
 		void RenderTime(double seconds);
