@@ -1,4 +1,9 @@
-# MediaPlayer
+# MediaPlayer-BBS
+
+## Original Project
+
+This project is based on
+[MediaPlayer](https://github.com/hackermdch/MediaPlayer).
 
 ## A decode library for Minecraft based on [ffmpeg](https://ffmpeg.org/).
 
