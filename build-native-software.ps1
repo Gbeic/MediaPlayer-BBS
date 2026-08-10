@@ -1,3 +1,4 @@
+# 兼容旧环境的纯软件解码构建入口；完整 native 构建请使用 build-native.ps1。
 param(
     [string] $FfmpegRoot = "$env:TEMP\bbs-mediaplayer-native\ffmpeg-master-latest-win64-lgpl-shared",
     [string] $VsRoot = "D:\yingyong\Microsoft Visual Studio\18\BuildTools"

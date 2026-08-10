@@ -108,7 +108,7 @@ export namespace MediaPlayer
 	{
 		std::unique_ptr<VideoFrame> vframe;
 		AVFormatContext* format;
-		AVCodec* codec;
+		const AVCodec* codec;
 		AVCodecContext* context;
 		AVHWDeviceType type;
 		int index;
@@ -130,7 +130,7 @@ export namespace MediaPlayer
 	class AudioDecoder final
 	{
 		AVFormatContext* format;
-		AVCodec* codec;
+		const AVCodec* codec;
 		AVCodecContext* context;
 		int index;
 		AVPacket* packet;

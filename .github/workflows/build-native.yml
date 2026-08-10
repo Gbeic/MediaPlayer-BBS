@@ -1,0 +1,105 @@
+name: 构建 MediaPlayer-BBS 完整 native 后端
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-native:
+    name: Windows x64 native 构建
+    runs-on: windows-2022
+    timeout-minutes: 45
+
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v5
+
+      - name: 配置 JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: 配置 MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: 安装 CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: '12.9.1'
+          method: network
+          sub-packages: '["nvcc", "cudart", "visual_studio_integration"]'
+
+      - name: 下载 FFmpeg LGPL shared 开发包
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'ffmpeg.zip'
+          $root = Join-Path $env:RUNNER_TEMP 'ffmpeg'
+          Invoke-WebRequest -Uri 'https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-09-13-03/ffmpeg-n8.1.2-34-g9b6c8969e0-win64-lgpl-shared-8.1.zip' -OutFile $archive
+          Expand-Archive -LiteralPath $archive -DestinationPath $root -Force
+          $ffmpegRoot = Get-ChildItem -LiteralPath $root -Directory | Select-Object -First 1
+          if (-not $ffmpegRoot) { throw 'FFmpeg 压缩包没有包含顶层目录。' }
+          "FFMPEG_ROOT=$($ffmpegRoot.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: 下载 nv-codec-headers
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'nv-codec-headers.zip'
+          $root = Join-Path $env:RUNNER_TEMP 'nv-codec-headers'
+          Invoke-WebRequest -Uri 'https://github.com/FFmpeg/nv-codec-headers/archive/eddcea9.zip' -OutFile $archive
+          Expand-Archive -LiteralPath $archive -DestinationPath $root -Force
+          $headersRoot = Get-ChildItem -LiteralPath $root -Directory | Select-Object -First 1
+          if (-not $headersRoot) { throw 'nv-codec-headers 压缩包没有包含顶层目录。' }
+          "NV_CODEC_ROOT=$($headersRoot.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: 下载 Khronos OpenGL 头文件
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'khronos'
+          $header = Join-Path $root 'KHR\khrplatform.h'
+          New-Item -ItemType Directory -Force -Path (Split-Path -Parent $header) | Out-Null
+          Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/KhronosGroup/EGL-Registry/main/api/KHR/khrplatform.h' -OutFile $header
+          "KHRONOS_INCLUDE_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: 下载 DXC
+        shell: pwsh
+        run: |
+          $tag = 'v1.9.2602.24'
+          $release = Invoke-RestMethod -Headers @{ 'User-Agent' = 'MediaPlayer-BBS CI' } -Uri "https://api.github.com/repos/microsoft/DirectXShaderCompiler/releases/tags/$tag"
+          $asset = $release.assets | Where-Object { $_.name -match 'win.*\.zip$|\.zip$' } | Select-Object -First 1
+          if (-not $asset) { throw 'DXC release 中没有找到 Windows 压缩包。' }
+          $archive = Join-Path $env:RUNNER_TEMP 'dxc.zip'
+          $root = Join-Path $env:RUNNER_TEMP 'dxc'
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $archive
+          Expand-Archive -LiteralPath $archive -DestinationPath $root -Force
+          $dxc = Get-ChildItem -LiteralPath $root -Recurse -Filter dxc.exe -File |
+            Where-Object { $_.FullName -match '[\\/]bin[\\/]x64[\\/]dxc\.exe$' } |
+            Select-Object -First 1
+          if (-not $dxc) { throw 'DXC 压缩包中没有 dxc.exe。' }
+          "DXC_ROOT=$($dxc.Directory.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: 构建完整 native 后端
+        shell: pwsh
+        run: .\build-native.ps1 -FfmpegRoot $env:FFMPEG_ROOT -NvCodecRoot $env:NV_CODEC_ROOT -CudaRoot $env:CUDA_PATH -DxcRoot $env:DXC_ROOT -KhronosIncludeRoot $env:KHRONOS_INCLUDE_ROOT
+
+      - name: 打包 native 测试产物
+        shell: pwsh
+        run: |
+          $staging = Join-Path $env:RUNNER_TEMP 'MediaPlayer-native-windows-x64'
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          Copy-Item -LiteralPath 'common/src/main/resources/MediaPlayer.dll' -Destination $staging -Force
+          Get-ChildItem -LiteralPath 'common/src/main/resources' -Filter '*.dll' -File | Copy-Item -Destination $staging -Force
+          Copy-Item -LiteralPath 'common/src/main/resources/BUILD-MANIFEST.txt' -Destination $staging -Force
+          Compress-Archive -Path (Join-Path $staging '*') -DestinationPath (Join-Path $env:RUNNER_TEMP 'MediaPlayer-native-windows-x64.zip') -Force
+
+      - name: 上传 native 测试产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: MediaPlayer-native-windows-x64
+          path: ${{ runner.temp }}/MediaPlayer-native-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 14

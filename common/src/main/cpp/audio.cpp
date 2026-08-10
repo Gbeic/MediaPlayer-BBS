@@ -26,7 +26,7 @@ AudioDecoder::AudioDecoder(const std::string& url)
 	index = av_find_best_stream(format, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
 	if (index < 0) av_log(nullptr, AV_LOG_ERROR, "Can't find audio stream in input file\n");
 	auto origin_par = format->streams[index]->codecpar;
-	codec = const_cast<AVCodec*>(avcodec_find_decoder(origin_par->codec_id));
+	codec = avcodec_find_decoder(origin_par->codec_id);
 	context = avcodec_alloc_context3(codec);
 	if (avcodec_parameters_to_context(context, origin_par) < 0) av_log(nullptr, AV_LOG_ERROR, "Error initializing the decoder context.\n");
 	ThrowOnFailed(avcodec_open2(context, codec, nullptr));
