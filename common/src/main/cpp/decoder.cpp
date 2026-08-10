@@ -75,7 +75,9 @@ VideoDecoder* VideoDecoder::Open(JNIEnv* env, jobject obj, const jstring path, c
 
 void VideoDecoder::Decode(JNIEnv*, const jobject obj)
 {
-	GetPtr<VideoDecoder>(obj)->Decode();
+	auto decoder = GetPtr<VideoDecoder>(obj);
+	// 时间轴模式启动后 FFmpeg 上下文归后台线程独占，旧播放器的顺序解码入口不能再并发访问。
+	if (!decoder->timelineWorkerStarted) decoder->Decode();
 }
 
 void VideoDecoder::RenderTime(JNIEnv*, const jobject obj, const jdouble seconds)
@@ -126,21 +128,42 @@ VideoDecoder::VideoDecoder(const std::string& url, const AVHWDeviceType hw_type,
 	frame = av_frame_alloc();
 	if (!frame) throw std::runtime_error("Failed to allocate frame");
 
+	pendingFrame = av_frame_alloc();
+	if (!pendingFrame) throw std::runtime_error("Failed to allocate pending frame");
+
+	readyFrame = av_frame_alloc();
+	if (!readyFrame) throw std::runtime_error("Failed to allocate ready frame");
+
+	presentationFrame = av_frame_alloc();
+	if (!presentationFrame) throw std::runtime_error("Failed to allocate presentation frame");
+
 	vframe = std::make_unique<VideoFrame>(type, (AVHWDeviceContext*)(context->hw_device_ctx ? context->hw_device_ctx->data : nullptr), tex);
 }
 
 
 VideoDecoder::~VideoDecoder()
 {
+	if (timelineWorkerStarted) {
+		{
+			std::lock_guard lock(timelineMutex);
+			stoppingTimelineWorker = true;
+		}
+		timelineCondition.notify_all();
+		if (timelineWorker.joinable()) timelineWorker.join();
+	}
+
 	// VideoFrame 可能仍持有硬件帧、CUDA 上下文或图形互操作资源，必须先释放。
 	vframe.reset();
+	av_frame_free(&presentationFrame);
+	av_frame_free(&readyFrame);
+	av_frame_free(&pendingFrame);
 	av_frame_free(&frame);
 	av_packet_free(&packet);
 	avcodec_free_context(&context);
 	avformat_free_context(format);
 }
 
-int VideoDecoder::Decode()
+int VideoDecoder::Decode(bool updateTexture)
 {
 	for (;;) {
 		int ret = av_read_frame(format, packet);
@@ -183,7 +206,14 @@ int VideoDecoder::Decode()
 					hasCurrentFrame = true;
 				}
 			}
-			vframe->Update(frame, context->hwaccel != nullptr);
+			if (updateTexture) {
+				vframe->Update(frame, context->hwaccel != nullptr);
+			}
+			else {
+				// 后台寻帧只保留最新硬件帧引用，到达目标后再交给渲染线程上传纹理。
+				av_frame_unref(pendingFrame);
+				hasPendingFrame = av_frame_ref(pendingFrame, frame) >= 0;
+			}
 			av_frame_unref(frame);
 			success = true;
 		}
@@ -191,10 +221,39 @@ int VideoDecoder::Decode()
 	}
 }
 
-void VideoDecoder::RenderTime(double seconds)
+bool VideoDecoder::BeginSeek(double seconds)
 {
-	if (!std::isfinite(seconds) || seconds < 0) seconds = 0;
+	AVStream* stream = format->streams[index];
+	const auto startTimestamp = stream->start_time == AV_NOPTS_VALUE ? 0 : stream->start_time;
+	const int64_t timestamp = startTimestamp
+		+ av_rescale_q((int64_t)(seconds * AV_TIME_BASE), AV_TIME_BASE_Q, stream->time_base);
 
+	if (av_seek_frame(format, index, timestamp, AVSEEK_FLAG_BACKWARD) < 0) return false;
+
+	avcodec_flush_buffers(context);
+	av_frame_unref(frame);
+	av_frame_unref(pendingFrame);
+	hasCurrentFrame = false;
+	hasPendingFrame = false;
+
+	return true;
+}
+
+void VideoDecoder::PublishPendingFrame(uint64_t generation)
+{
+	if (!hasPendingFrame) return;
+
+	std::lock_guard lock(timelineMutex);
+	av_frame_unref(readyFrame);
+	hasReadyFrame = av_frame_ref(readyFrame, pendingFrame) >= 0;
+	if (!hasReadyFrame) return;
+
+	readyFrameSeconds = currentFrameSeconds;
+	readyFrameGeneration = generation;
+}
+
+bool VideoDecoder::DecodeTimelineTarget(double seconds, uint64_t& generation)
+{
 	AVStream* stream = format->streams[index];
 	const auto frameDuration = stream->avg_frame_rate.num > 0 && stream->avg_frame_rate.den > 0
 		? av_q2d(av_inv_q(stream->avg_frame_rate))
@@ -205,30 +264,127 @@ void VideoDecoder::RenderTime(double seconds)
 		|| seconds < currentFrameSeconds - frameTolerance
 		|| seconds > currentFrameSeconds + seekThreshold;
 
-	if (needsSeek) {
-		const auto startTimestamp = stream->start_time == AV_NOPTS_VALUE ? 0 : stream->start_time;
-		const int64_t timestamp = startTimestamp
-			+ av_rescale_q((int64_t)(seconds * AV_TIME_BASE), AV_TIME_BASE_Q, stream->time_base);
-		if (av_seek_frame(format, index, timestamp, AVSEEK_FLAG_BACKWARD) < 0) return;
-		// 时间轴跳转后必须清空解码器缓存，否则会混入 seek 前的旧帧。
-		avcodec_flush_buffers(context);
-		hasCurrentFrame = false;
+	if (needsSeek && !BeginSeek(seconds)) return true;
 
-		// seek 到关键帧后连续解码，直到纹理对应的帧真正到达目标时间。
-		for (int attempts = 0; attempts < 240; attempts++) {
-			const int result = Decode();
-			if (result == AVERROR_EOF) return;
-			if (hasCurrentFrame && currentFrameSeconds >= seconds - frameTolerance) return;
+	if (hasCurrentFrame && seconds <= currentFrameSeconds + frameTolerance) {
+		PublishPendingFrame(generation);
+		return true;
+	}
+
+	// 本地文件理论上会在到达目标前结束；上限只用于防止损坏媒体无限占用后台线程。
+	for (int attempts = 0; attempts < 4096; attempts++) {
+		const int result = Decode(false);
+
+		{
+			std::lock_guard lock(timelineMutex);
+			if (stoppingTimelineWorker) return false;
+
+			if (requestGeneration != generation) {
+				const auto latestSeconds = requestedSeconds;
+				const bool targetPassed = hasCurrentFrame
+					&& latestSeconds < currentFrameSeconds - frameTolerance;
+				const bool targetMovedFar = std::abs(latestSeconds - seconds) > seekThreshold;
+				seconds = latestSeconds;
+				generation = requestGeneration;
+
+				// 新目标已经落在当前帧之后，或跨过了关键帧搜索区间，立即放弃旧任务并重新 seek。
+				if (targetPassed || targetMovedFar) return false;
+			}
 		}
-		return;
+
+		if (result < 0 || (hasCurrentFrame && currentFrameSeconds >= seconds - frameTolerance)) {
+			PublishPendingFrame(generation);
+			return true;
+		}
 	}
 
-	if (seconds <= currentFrameSeconds + frameTolerance) return;
+	PublishPendingFrame(generation);
+	return true;
+}
 
-	// 正向播放时一个游戏 tick 可能跨越多帧，不能只消费一个 packet。
-	for (int attempts = 0; attempts < 240; attempts++) {
-		const int result = Decode();
-		if (result == AVERROR_EOF) return;
-		if (hasCurrentFrame && currentFrameSeconds >= seconds - frameTolerance) return;
+void VideoDecoder::RunTimelineWorker()
+{
+	uint64_t handledGeneration = 0;
+
+	for (;;) {
+		double seconds;
+		uint64_t generation;
+		{
+			std::unique_lock lock(timelineMutex);
+			timelineCondition.wait(lock, [&]() {
+				return stoppingTimelineWorker
+					|| (requestGeneration != handledGeneration
+						&& !hasReadyFrame
+						&& !presentationInProgress);
+			});
+
+			if (stoppingTimelineWorker) return;
+			seconds = requestedSeconds;
+			generation = requestGeneration;
+		}
+
+		if (DecodeTimelineTarget(seconds, generation)) {
+			handledGeneration = generation;
+		}
 	}
+}
+
+void VideoDecoder::EnsureTimelineWorker()
+{
+	if (timelineWorkerStarted) return;
+	timelineWorker = std::thread(&VideoDecoder::RunTimelineWorker, this);
+	timelineWorkerStarted = true;
+}
+
+void VideoDecoder::RenderTime(double seconds)
+{
+	if (!std::isfinite(seconds) || seconds < 0) seconds = 0;
+	EnsureTimelineWorker();
+
+	AVStream* stream = format->streams[index];
+	const auto frameDuration = stream->avg_frame_rate.num > 0 && stream->avg_frame_rate.den > 0
+		? av_q2d(av_inv_q(stream->avg_frame_rate))
+		: 1.0 / 60.0;
+	const auto seekThreshold = std::max(0.25, frameDuration * 8.0);
+	const auto frameTolerance = frameDuration * 0.5;
+	bool uploadFrame = false;
+	bool wakeWorker = false;
+
+	{
+		std::lock_guard lock(timelineMutex);
+		if (!hasRequestedTime || std::abs(seconds - requestedSeconds) > frameTolerance) {
+			requestedSeconds = seconds;
+			requestGeneration += 1;
+			hasRequestedTime = true;
+			wakeWorker = true;
+		}
+
+		if (hasReadyFrame) {
+			const bool matchesLatestRequest = readyFrameGeneration == requestGeneration;
+			const bool isNearLatestRequest = std::abs(readyFrameSeconds - seconds) <= seekThreshold;
+			if (matchesLatestRequest || isNearLatestRequest) {
+				av_frame_unref(presentationFrame);
+				av_frame_move_ref(presentationFrame, readyFrame);
+				presentationInProgress = true;
+				uploadFrame = true;
+			}
+			else {
+				av_frame_unref(readyFrame);
+			}
+			hasReadyFrame = false;
+			wakeWorker = true;
+		}
+	}
+
+	if (wakeWorker) timelineCondition.notify_all();
+	if (!uploadFrame) return;
+
+	// OpenGL 与图形互操作资源只能在 Minecraft 渲染线程更新。
+	vframe->Update(presentationFrame, context->hwaccel != nullptr);
+	av_frame_unref(presentationFrame);
+	{
+		std::lock_guard lock(timelineMutex);
+		presentationInProgress = false;
+	}
+	timelineCondition.notify_all();
 }

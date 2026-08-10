@@ -1,7 +1,11 @@
 module;
 #include <jni.h>
+#include <condition_variable>
+#include <cstdint>
+#include <mutex>
 #include <string>
 #include <memory>
+#include <thread>
 #include <vector>
 #include <tuple>
 #include <d3d12.h>
@@ -113,10 +117,31 @@ export namespace MediaPlayer
 		int index;
 		AVPacket* packet;
 		AVFrame* frame;
+		AVFrame* pendingFrame;
+		AVFrame* readyFrame;
+		AVFrame* presentationFrame;
 		double currentFrameSeconds{};
+		double requestedSeconds{};
+		double readyFrameSeconds{};
+		uint64_t requestGeneration{};
+		uint64_t readyFrameGeneration{};
 		bool hasCurrentFrame{};
+		bool hasPendingFrame{};
+		bool hasRequestedTime{};
+		bool hasReadyFrame{};
+		bool presentationInProgress{};
+		bool timelineWorkerStarted{};
+		bool stoppingTimelineWorker{};
+		std::thread timelineWorker;
+		std::mutex timelineMutex;
+		std::condition_variable timelineCondition;
 
-		int Decode();
+		int Decode(bool updateTexture = true);
+		bool BeginSeek(double seconds);
+		bool DecodeTimelineTarget(double seconds, uint64_t& generation);
+		void PublishPendingFrame(uint64_t generation);
+		void RunTimelineWorker();
+		void EnsureTimelineWorker();
 		void RenderTime(double seconds);
 	public:
 		explicit VideoDecoder(const std::string& url, AVHWDeviceType type, GLuint tex);
