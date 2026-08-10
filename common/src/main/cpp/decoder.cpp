@@ -2,8 +2,11 @@ module;
 #include <vector>
 #include <memory>
 #include <algorithm>
+#include <condition_variable>
 #include <cmath>
+#include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <jni.h>
 #include "jnipp.h"
 extern "C" {
