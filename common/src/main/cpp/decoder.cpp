@@ -183,6 +183,8 @@ void VideoDecoder::RenderTime(double seconds)
 		avcodec_flush_buffers(context);
 	}
 
-	// 第一版先 seek 到目标附近并解出一帧，后续再补“解到最接近目标时间”的精细策略。
-	while (Decode() < 0)(void)0;
+	// seek 后限制读取次数，避免视频末尾或损坏文件让主线程无限等待。
+	for (int attempts = 0; attempts < 120; attempts++) {
+		if (Decode() >= 0) return;
+	}
 }

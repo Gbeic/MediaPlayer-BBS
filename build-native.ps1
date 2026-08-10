@@ -105,7 +105,6 @@ if (-not $javaHome -or -not (Test-Path -LiteralPath (Join-Path $javaHome "includ
 
 $ffmpegInclude = Join-Path $FfmpegRoot "include"
 $ffmpegLib = Join-Path $FfmpegRoot "lib"
-$ffmpegBin = Join-Path $FfmpegRoot "bin"
 $nvCodecInclude = Join-Path $NvCodecRoot "include"
 if (-not (Test-Path -LiteralPath (Join-Path $nvCodecInclude "ffnvcodec"))) {
     $nvCodecInclude = $NvCodecRoot
@@ -122,6 +121,12 @@ foreach ($path in @(
     if (-not (Test-Path -LiteralPath $path)) {
         throw "native 依赖文件不存在：$path"
     }
+}
+
+$ffmpegLibraries = Get-ChildItem -LiteralPath $ffmpegLib -Recurse -Filter "*.lib" -File |
+    Select-Object -ExpandProperty FullName
+if (-not $ffmpegLibraries) {
+    throw "FFmpeg 静态库目录中没有可链接的 .lib 文件：$ffmpegLib"
 }
 
 $cl = Resolve-RequiredTool "cl.exe"
@@ -162,14 +167,14 @@ if ($KhronosIncludeRoot) {
     $includeArgs += "/I$KhronosIncludeRoot"
 }
 $moduleArgs = @(
-    "/nologo", "/std:c++20", "/EHsc", "/MD", "/wd5202", "/c",
+    "/nologo", "/std:c++20", "/EHsc", "/O2", "/MD", "/wd5202", "/c",
     "/ifcOutput", "$BuildRoot\",
     "/Fo$BuildRoot\media.obj"
 ) + $includeArgs + @((Join-Path $sourceRoot "media.ixx"))
 Invoke-CheckedTool $cl $moduleArgs
 
 $resourceModuleArgs = @(
-    "/nologo", "/std:c++20", "/EHsc", "/MD", "/c",
+    "/nologo", "/std:c++20", "/EHsc", "/O2", "/MD", "/c",
     "/ifcOutput", "$BuildRoot\",
     "/Fo$BuildRoot\resource.obj"
 ) + $includeArgs + @((Join-Path $sourceRoot "res.ixx"))
@@ -187,7 +192,7 @@ $objects = @(
     (Join-Path $BuildRoot "resource.obj")
 )
 $commonCompileArgs = @(
-    "/nologo", "/std:c++20", "/EHsc", "/MD", "/wd5202", "/c",
+    "/nologo", "/std:c++20", "/EHsc", "/O2", "/MD", "/wd5202", "/c",
     "/ifcSearchDir", $BuildRoot,
     "/reference", "Media=$BuildRoot\Media.ifc",
     "/reference", "Resource=$BuildRoot\Resource.ifc"
@@ -203,7 +208,7 @@ foreach ($file in $cppFiles) {
 foreach ($file in @("gl.c", "wgl.c")) {
     $source = Join-Path $sourceRoot $file
     $object = Join-Path $BuildRoot ([System.IO.Path]::ChangeExtension($file, ".obj"))
-    Invoke-CheckedTool $cl (@("/nologo", "/MD", "/TC", "/c") + $includeArgs + @("/Fo$object", $source))
+    Invoke-CheckedTool $cl (@("/nologo", "/O2", "/MD", "/TC", "/c") + $includeArgs + @("/Fo$object", $source))
     $objects += $object
 }
 
@@ -212,9 +217,10 @@ Invoke-CheckedTool $nvcc @(
     "-c", (Join-Path $sourceRoot "cuda.cu"),
     "-o", $cudaObject,
     "-std=c++20",
+    "-O3",
     "-cudart", "static",
     "-ccbin", $cl,
-    "-Xcompiler", "/EHsc /MD",
+    "-Xcompiler", "/EHsc /O2 /MD",
     "-I$($javaHome)\include",
     "-I$($javaHome)\include\win32",
     "-I$ffmpegInclude",
@@ -224,37 +230,30 @@ Invoke-CheckedTool $nvcc @(
 $objects += $cudaObject
 
 $resourceObject = Join-Path $BuildRoot "shader_resources.obj"
-Invoke-CheckedTool $cl (@("/nologo", "/EHsc", "/MD", "/c", "/Fo$resourceObject", $resourceSource))
+Invoke-CheckedTool $cl (@("/nologo", "/EHsc", "/O2", "/MD", "/c", "/Fo$resourceObject", $resourceSource))
 $objects += $resourceObject
 
 $outputDll = Join-Path $OutputRoot "MediaPlayer.dll"
 $outputLib = Join-Path $BuildRoot "MediaPlayer.lib"
 $outputPdb = Join-Path $BuildRoot "MediaPlayer.pdb"
 $linkArgs = @(
-    "/NOLOGO", "/DLL", "/OUT:$outputDll", "/IMPLIB:$outputLib", "/PDB:$outputPdb"
-) + $objects + @(
-    "/LIBPATH:$ffmpegLib",
+    "/NOLOGO", "/DLL", "/OPT:REF", "/OPT:ICF", "/OUT:$outputDll", "/IMPLIB:$outputLib", "/PDB:$outputPdb"
+) + $objects + $ffmpegLibraries + @(
     "/LIBPATH:$cudaLib",
-    "avcodec.lib", "avformat.lib", "avutil.lib", "swscale.lib", "swresample.lib",
     "cudart_static.lib", "d3d11.lib", "d3d12.lib", "dxgi.lib", "d3dcompiler.lib",
     "opengl32.lib", "ole32.lib", "user32.lib", "gdi32.lib",
-    "advapi32.lib", "userenv.lib", "ws2_32.lib", "crypt32.lib", "ncrypt.lib"
+    "advapi32.lib", "bcrypt.lib", "secur32.lib", "shell32.lib", "shlwapi.lib",
+    "oleaut32.lib", "uuid.lib", "version.lib", "vfw32.lib", "strmiids.lib",
+    "userenv.lib", "ws2_32.lib", "crypt32.lib", "ncrypt.lib"
 )
 Invoke-CheckedTool $link $linkArgs
-
-foreach ($pattern in @("avcodec-*.dll", "avformat-*.dll", "avutil-*.dll", "swscale-*.dll", "swresample-*.dll")) {
-    $runtime = Get-ChildItem -LiteralPath $ffmpegBin -Filter $pattern -File
-    if (-not $runtime) {
-        throw "FFmpeg 运行库不存在：$pattern"
-    }
-    $runtime | Copy-Item -Destination $OutputRoot -Force
-}
 
 $manifest = @(
     "MediaPlayer-BBS 完整 native 后端",
     "",
     "该目录用于复制到 MediaPlayer-BBS/common/src/main/resources。",
-    "MediaPlayer.dll 使用 FFmpeg shared，并静态链接 CUDA runtime，包含 CUDA/D3D11VA/D3D12VA 构建路径。",
+    "MediaPlayer.dll 静态链接 FFmpeg 和 CUDA runtime，包含 CUDA/D3D11VA/D3D12VA 构建路径。",
+    "运行时只需要本目录中的 MediaPlayer.dll，不需要额外携带 FFmpeg 或 CUDA runtime DLL。",
     "GitHub Actions runner 没有可用于运行时验证的 NVIDIA GPU，因此硬解只完成编译，不代表本机运行时必然启用。"
 )
 Set-Content -LiteralPath (Join-Path $OutputRoot "BUILD-MANIFEST.txt") -Value $manifest -Encoding utf8

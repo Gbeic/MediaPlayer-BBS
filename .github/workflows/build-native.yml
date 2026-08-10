@@ -10,7 +10,7 @@ jobs:
   build-native:
     name: Windows x64 native 构建
     runs-on: windows-2022
-    timeout-minutes: 45
+    timeout-minutes: 90
 
     steps:
       - name: 检出源码
@@ -34,16 +34,26 @@ jobs:
           method: network
           sub-packages: '["nvcc", "cudart", "visual_studio_integration"]'
 
-      - name: 下载 FFmpeg LGPL shared 开发包
+      - name: 缓存 vcpkg 静态依赖
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/vcpkg-binary-cache
+          key: vcpkg-ffmpeg-static-md-${{ runner.os }}-2026-08-10
+
+      - name: 构建 FFmpeg LGPL 静态开发库
         shell: pwsh
         run: |
-          $archive = Join-Path $env:RUNNER_TEMP 'ffmpeg.zip'
-          $root = Join-Path $env:RUNNER_TEMP 'ffmpeg'
-          Invoke-WebRequest -Uri 'https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-09-13-03/ffmpeg-n8.1.2-34-g9b6c8969e0-win64-lgpl-shared-8.1.zip' -OutFile $archive
-          Expand-Archive -LiteralPath $archive -DestinationPath $root -Force
-          $ffmpegRoot = Get-ChildItem -LiteralPath $root -Directory | Select-Object -First 1
-          if (-not $ffmpegRoot) { throw 'FFmpeg 压缩包没有包含顶层目录。' }
-          "FFMPEG_ROOT=$($ffmpegRoot.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $vcpkg = Join-Path $env:VCPKG_INSTALLATION_ROOT 'vcpkg.exe'
+          $binaryCache = Join-Path $env:RUNNER_TEMP 'vcpkg-binary-cache'
+          New-Item -ItemType Directory -Force -Path $binaryCache | Out-Null
+          $env:VCPKG_BINARY_SOURCES = "clear;files,$binaryCache,readwrite"
+          & $vcpkg install 'ffmpeg[avcodec,avformat,nvcodec,swresample,swscale]:x64-windows-static-md' --clean-after-build
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg 构建 FFmpeg 失败，退出码：$LASTEXITCODE" }
+          $ffmpegRoot = Join-Path $env:VCPKG_INSTALLATION_ROOT 'installed\x64-windows-static-md'
+          if (-not (Test-Path -LiteralPath (Join-Path $ffmpegRoot 'lib\avcodec.lib'))) {
+            throw 'FFmpeg 静态库没有生成。'
+          }
+          "FFMPEG_ROOT=$ffmpegRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: 下载 nv-codec-headers
         shell: pwsh
@@ -92,7 +102,6 @@ jobs:
           $staging = Join-Path $env:RUNNER_TEMP 'MediaPlayer-native-windows-x64'
           New-Item -ItemType Directory -Force -Path $staging | Out-Null
           Copy-Item -LiteralPath 'common/src/main/resources/MediaPlayer.dll' -Destination $staging -Force
-          Get-ChildItem -LiteralPath 'common/src/main/resources' -Filter '*.dll' -File | Copy-Item -Destination $staging -Force
           Copy-Item -LiteralPath 'common/src/main/resources/BUILD-MANIFEST.txt' -Destination $staging -Force
           Compress-Archive -Path (Join-Path $staging '*') -DestinationPath (Join-Path $env:RUNNER_TEMP 'MediaPlayer-native-windows-x64.zip') -Force
 

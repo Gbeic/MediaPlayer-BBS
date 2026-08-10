@@ -28,6 +28,7 @@ public final class VideoDecoder implements AutoCloseable {
     private double lastTime;
     private double deltaTime;
     private double lastTimelineSeconds = Double.NaN;
+    private double lastDecodedTimelineSeconds = Double.NaN;
     private final Minecraft minecraft = Minecraft.getInstance();
     private static boolean timelineNativeAvailable = true;
 
@@ -123,20 +124,34 @@ public final class VideoDecoder implements AutoCloseable {
 
     public void renderTime(double seconds) {
         var targetSeconds = Double.isFinite(seconds) ? Math.max(0.0, seconds) : 0.0;
+        var frameInterval = frameRate > 0.0 ? frameRate : 1.0 / 60.0;
+        var maxContinuousGap = Math.max(0.25, frameInterval * 8.0);
+        var firstFrame = Double.isNaN(lastDecodedTimelineSeconds);
+        var movedBack = !Double.isNaN(lastTimelineSeconds)
+                && targetSeconds < lastTimelineSeconds - frameInterval * 0.5;
+        var jumpedForward = !firstFrame
+                && targetSeconds - lastDecodedTimelineSeconds > maxContinuousGap;
+        var needsSeek = firstFrame || movedBack || jumpedForward;
 
-        if (timelineNativeAvailable) {
+        if (timelineNativeAvailable && needsSeek) {
             try {
                 renderTimeNative(targetSeconds);
                 lastTimelineSeconds = targetSeconds;
+                lastDecodedTimelineSeconds = targetSeconds;
                 return;
             } catch (UnsatisfiedLinkError e) {
                 timelineNativeAvailable = false;
-                MediaPlayer.LOGGER.warn("native 时间轴寻帧接口不可用，暂时退回连续解码路径");
+                MediaPlayer.LOGGER.warn("native 时间轴寻帧接口不可用，退回连续解码路径");
             }
         }
 
-        if (Double.isNaN(lastTimelineSeconds) || targetSeconds >= lastTimelineSeconds) {
+        // 老 native 没有时间轴寻帧接口时只能顺序解码，至少保持首次画面和正向播放可用。
+        if (!timelineNativeAvailable && firstFrame) {
             decode();
+            lastDecodedTimelineSeconds = targetSeconds;
+        } else if (!needsSeek && targetSeconds - lastDecodedTimelineSeconds >= frameInterval * 0.5) {
+            decode();
+            lastDecodedTimelineSeconds = targetSeconds;
         }
 
         lastTimelineSeconds = targetSeconds;

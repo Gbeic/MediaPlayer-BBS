@@ -20,13 +20,6 @@ public final class MediaPlayer {
     public static final Logger LOGGER = LoggerFactory.getLogger(MediaPlayer.class);
     private static final boolean NATIVE_AVAILABLE;
     private static final String UNAVAILABLE_REASON;
-    private static final String[] NATIVE_DEPENDENCIES = {
-            "avutil-61.dll",
-            "swresample-7.dll",
-            "swscale-10.dll",
-            "avcodec-63.dll",
-            "avformat-63.dll"
-    };
     private static Path nativeTempDir;
 
     static {
@@ -37,10 +30,6 @@ public final class MediaPlayer {
             reason = "当前系统不支持 MediaPlayer-BBS native 后端";
         } else {
             try {
-                for (String dependency : NATIVE_DEPENDENCIES) {
-                    copyAndLoadNativeLibrary(dependency);
-                }
-
                 copyAndLoadNativeLibrary("MediaPlayer.dll");
                 available = true;
             } catch (Throwable e) {
