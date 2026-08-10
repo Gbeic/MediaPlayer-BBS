@@ -237,7 +237,7 @@ $outputDll = Join-Path $OutputRoot "MediaPlayer.dll"
 $outputLib = Join-Path $BuildRoot "MediaPlayer.lib"
 $outputPdb = Join-Path $BuildRoot "MediaPlayer.pdb"
 $linkArgs = @(
-    "/NOLOGO", "/DLL", "/OPT:REF", "/OPT:ICF", "/NODEFAULTLIB:LIBCMT",
+    "/NOLOGO", "/DLL", "/DEBUG:FULL", "/OPT:REF", "/OPT:ICF", "/NODEFAULTLIB:LIBCMT",
     "/OUT:$outputDll", "/IMPLIB:$outputLib", "/PDB:$outputPdb"
 ) + $objects + $ffmpegLibraries + @(
     "/LIBPATH:$cudaLib",

@@ -95,20 +95,21 @@ jobs:
         shell: pwsh
         run: .\build-native.ps1 -FfmpegRoot $env:FFMPEG_ROOT -NvCodecRoot $env:NV_CODEC_ROOT -CudaRoot $env:CUDA_PATH -DxcRoot $env:DXC_ROOT -KhronosIncludeRoot $env:KHRONOS_INCLUDE_ROOT
 
-      - name: 打包 native 测试产物
+      - name: 准备 native 测试产物
         shell: pwsh
         run: |
           $staging = Join-Path $env:RUNNER_TEMP 'MediaPlayer-native-windows-x64'
           New-Item -ItemType Directory -Force -Path $staging | Out-Null
           Copy-Item -LiteralPath 'common/src/main/resources/MediaPlayer.dll' -Destination $staging -Force
           Copy-Item -LiteralPath 'common/src/main/resources/BUILD-MANIFEST.txt' -Destination $staging -Force
-          Compress-Archive -Path (Join-Path $staging '*') -DestinationPath (Join-Path $env:RUNNER_TEMP 'MediaPlayer-native-windows-x64.zip') -Force
 
       - name: 上传 native 测试产物
         uses: actions/upload-artifact@v4
         with:
           name: MediaPlayer-native-windows-x64
-          path: ${{ runner.temp }}/MediaPlayer-native-windows-x64.zip
+          path: |
+            ${{ runner.temp }}/MediaPlayer-native-windows-x64/MediaPlayer.dll
+            ${{ runner.temp }}/MediaPlayer-native-windows-x64/BUILD-MANIFEST.txt
           if-no-files-found: error
           retention-days: 14
 
