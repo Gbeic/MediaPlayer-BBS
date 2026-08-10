@@ -237,13 +237,15 @@ $outputDll = Join-Path $OutputRoot "MediaPlayer.dll"
 $outputLib = Join-Path $BuildRoot "MediaPlayer.lib"
 $outputPdb = Join-Path $BuildRoot "MediaPlayer.pdb"
 $linkArgs = @(
-    "/NOLOGO", "/DLL", "/OPT:REF", "/OPT:ICF", "/OUT:$outputDll", "/IMPLIB:$outputLib", "/PDB:$outputPdb"
+    "/NOLOGO", "/DLL", "/OPT:REF", "/OPT:ICF", "/NODEFAULTLIB:LIBCMT",
+    "/OUT:$outputDll", "/IMPLIB:$outputLib", "/PDB:$outputPdb"
 ) + $objects + $ffmpegLibraries + @(
     "/LIBPATH:$cudaLib",
     "cudart_static.lib", "d3d11.lib", "d3d12.lib", "dxgi.lib", "d3dcompiler.lib",
     "opengl32.lib", "ole32.lib", "user32.lib", "gdi32.lib",
     "advapi32.lib", "bcrypt.lib", "secur32.lib", "shell32.lib", "shlwapi.lib",
     "oleaut32.lib", "uuid.lib", "version.lib", "vfw32.lib", "strmiids.lib",
+    "mf.lib", "mfplat.lib", "mfuuid.lib",
     "userenv.lib", "ws2_32.lib", "crypt32.lib", "ncrypt.lib"
 )
 Invoke-CheckedTool $link $linkArgs
