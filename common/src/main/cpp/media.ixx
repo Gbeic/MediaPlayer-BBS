@@ -97,6 +97,7 @@ export namespace MediaPlayer
 		int swsWidth{}, swsHeight{};              // sws 上下文对应的输入尺寸
 		AVPixelFormat swsFormat{};                // sws 上下文对应的输入像素格式
 		void* cu_surface{};                       // CUDA surface 对象，跨帧复用
+		void* cu_array{};                         // surface 对应的 mapped array 指针，变化时重建
 		int cu_surface_width{}, cu_surface_height{}; // surface 对应的尺寸，变化时重建
 		HANDLE DXNVDevice;
 		void* TextureObject;

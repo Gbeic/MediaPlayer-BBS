@@ -73,7 +73,10 @@ VideoDecoder* VideoDecoder::Open(JNIEnv* env, jobject obj, const jstring path, c
 		for (int attempts = 0; attempts < 60; attempts++) {
 			if (ptr->Decode() >= 0) {
 				const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - openStart).count();
-				fprintf(stderr, "[MediaPlayer-BBS] 打开视频耗时 %lld ms（第 %d 次解码得到首帧）: %s\n", (long long)elapsedMs, attempts + 1, pathStr.c_str());
+				// 打印实际使用的硬件解码路径，便于确认 CUDA/D3D12/D3D11/软解哪一条生效。
+				const char* hwName = av_hwdevice_get_type_name(type);
+				const std::string hwType = hwName ? hwName : "software";
+				fprintf(stderr, "[MediaPlayer-BBS] 打开视频耗时 %lld ms（第 %d 次解码得到首帧，解码器: %s）: %s\n", (long long)elapsedMs, attempts + 1, hwType.c_str(), pathStr.c_str());
 				return ptr.release();
 			}
 		}

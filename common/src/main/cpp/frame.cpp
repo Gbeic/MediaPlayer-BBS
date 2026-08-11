@@ -182,18 +182,21 @@ void VideoFrame::UpdateCUDA(const AVFrame* frame)
 		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, frame->width, frame->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
 		if (cuda->cuGraphicsGLRegisterImage(&cu_res, hw_texture, GL_TEXTURE_2D, CU_GRAPHICS_REGISTER_FLAGS_SURFACE_LDST) != CUDA_SUCCESS) goto cleanup;
 	}
-	// surface 对象按帧尺寸缓存复用，仅当分辨率变化时重建，避免每帧创建/销毁的驱动开销。
-	if (!cu_surface || cu_surface_width != frame->width || cu_surface_height != frame->height)
+	// 必须先 map 资源才能获取 mapped array（unmap 后 array 视为失效），
+	// 因此每帧都在 map 状态下取 array 并核对指针，只有指针或分辨率变化时才重建 surface，
+	// 其余帧复用 surface，避免每帧创建/销毁的驱动开销。
+	if (cuda->cuGraphicsMapResources(1, &cu_res, stream) != CUDA_SUCCESS) goto cleanup;
+	mapped = true;
+	if (cuda->cuGraphicsSubResourceGetMappedArray(&array, cu_res, 0, 0) != CUDA_SUCCESS) goto cleanup;
+	if (!cu_surface || cu_surface_width != frame->width || cu_surface_height != frame->height || cu_array != (void*)array)
 	{
-		if (cuda->cuGraphicsSubResourceGetMappedArray(&array, cu_res, 0, 0) != CUDA_SUCCESS) goto cleanup;
 		if (cu_surface) DestroyCUDAArraySurface(cu_surface);
 		cu_surface = CreateCUDAArraySurface(array);
 		if (!cu_surface) goto cleanup;
 		cu_surface_width = frame->width;
 		cu_surface_height = frame->height;
+		cu_array = (void*)array;
 	}
-	if (cuda->cuGraphicsMapResources(1, &cu_res, stream) != CUDA_SUCCESS) goto cleanup;
-	mapped = true;
 	if (RunCUDACompute(frame->data[0], frame->data[1], cu_surface, stream, frame->width, frame->height, frame->linesize[0], frame->linesize[1]) != 0) goto cleanup;
 
 cleanup:
