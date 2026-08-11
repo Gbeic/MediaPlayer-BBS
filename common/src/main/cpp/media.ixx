@@ -1,5 +1,6 @@
 module;
 #include <jni.h>
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
@@ -19,6 +20,7 @@ extern "C" {
 #include <libavcodec/bsf.h>
 #include <libavformat/avformat.h>
 #include <libswresample/swresample.h>
+#include <libswscale/swscale.h>
 }
 export module Media;
 
@@ -73,6 +75,9 @@ export namespace MediaPlayer
 		ComPtr<ID3D11Texture2D> ComputeResult;
 		ComPtr<ID3D11ComputeShader> ComputeShader;
 		ComPtr<ID3D11UnorderedAccessView> UAV;
+		ComPtr<ID3D11ShaderResourceView> srv1, srv2;   // D3D11 缓存的解码纹理 SRV，纹理或 slice 变化时才重建
+		ID3D11Texture2D* cachedD3D11Tex{};             // 上次 SRV 对应的解码纹理
+		int64_t cachedD3D11Slice{ -1 };                // 上次 SRV 对应的纹理 array slice
 		ComPtr<ID3D12Device> D3D12Device;
 		ComPtr<ID3D12CommandQueue> CommandQueue;
 		ComPtr<ID3D12CommandAllocator> CommandAllocator;
@@ -83,10 +88,16 @@ export namespace MediaPlayer
 		ComPtr<ID3D12Resource> OutputBuffer;
 		ComPtr<ID3D12Fence> fence;
 		HANDLE FenceEvent;
-		HANDLE SharedHandle;
-		uint32_t memory;
-		uint64_t FenceValue;
+		HANDLE SharedHandle{};
+		uint32_t memory{};
+		uint64_t FenceValue{};
 		Descriptor SRV0, SRV1, UAV0;
+		SwsContext* sws{};                        // 软解复用的 sws 上下文
+		AVFrame* swsOutput{};                     // 软解复用的 RGBA 输出帧
+		int swsWidth{}, swsHeight{};              // sws 上下文对应的输入尺寸
+		AVPixelFormat swsFormat{};                // sws 上下文对应的输入像素格式
+		void* cu_surface{};                       // CUDA surface 对象，跨帧复用
+		int cu_surface_width{}, cu_surface_height{}; // surface 对应的尺寸，变化时重建
 		HANDLE DXNVDevice;
 		void* TextureObject;
 		CudaFunctions* cuda;
@@ -132,6 +143,11 @@ export namespace MediaPlayer
 		bool presentationInProgress{};
 		bool timelineWorkerStarted{};
 		bool stoppingTimelineWorker{};
+		// 无锁快速路径标志：画面已就绪且目标时间未变（暂停/静止画面）时为 false，
+		// 渲染线程可直接返回，避免暂停时每帧加锁唤醒后台线程。
+		std::atomic_bool quickBusy{ false };
+		// 最近一次完整路径处理的目标时间，配合 quickBusy 判断是否可走快速路径。
+		std::atomic<double> lastQuickSeconds{ -1.0 };
 		std::thread timelineWorker;
 		std::mutex timelineMutex;
 		std::condition_variable timelineCondition;

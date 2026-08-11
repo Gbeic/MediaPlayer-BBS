@@ -44,7 +44,9 @@ int RunCUDACompute(void* y, void* uv, void* output, void* stream, const uint32_t
 	return cudaStreamSynchronize((cudaStream_t)stream);
 }
 
-void* InitCUDA(void* array)
+// surface 创建/销毁由 cuda.cu 提供，供 frame.cpp 缓存复用。
+// 这样 VideoFrame 只需持有不透明指针，不必依赖驱动 API 加载结构是否暴露 surface 接口。
+void* CreateCUDAArraySurface(const void* array)
 {
 	cudaResourceDesc resDesc{};
 	resDesc.resType = cudaResourceTypeArray;
@@ -52,4 +54,9 @@ void* InitCUDA(void* array)
 	cudaSurfaceObject_t surface{};
 	if (cudaCreateSurfaceObject(&surface, &resDesc) != cudaSuccess) return nullptr;
 	return (void*)surface;
+}
+
+int DestroyCUDAArraySurface(void* surface)
+{
+	return cudaDestroySurfaceObject((cudaSurfaceObject_t)surface);
 }

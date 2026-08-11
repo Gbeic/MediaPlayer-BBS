@@ -21,41 +21,37 @@ import Resource;
 
 using namespace MediaPlayer;
 
-extern "C" int cudaDestroySurfaceObject(void*);
-
-static void SyncFence(ID3D12Fence* fence, uint64_t value, HANDLE event)
-{
-	for (int i = 0; i < 20; i++) if (fence->GetCompletedValue() >= value) return;
-	fence->SetEventOnCompletion(value, event);
-	WaitForSingleObject(event, INFINITE);
-}
-
-static auto ConvertRGBA(const AVFrame* frame)
-{
-	auto out = av_frame_alloc();
-	auto sws = sws_getContext(frame->width, frame->height, (AVPixelFormat)frame->format, frame->width, frame->height, AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr, nullptr, nullptr);
-	out->format = AV_PIX_FMT_RGBA;
-	out->width = frame->width;
-	out->height = frame->height;
-	av_frame_get_buffer(out, 1);
-	sws_scale(sws, frame->data, frame->linesize, 0, frame->height, out->data, out->linesize);
-	sws_freeContext(sws);
-	return out;
-}
-
 void VideoFrame::UpdateSW(const AVFrame* frame)
 {
-	auto rgba = ConvertRGBA(frame);
+	// sws 上下文与 RGBA 输出帧跨帧复用，仅当输入尺寸或像素格式变化时重建，
+	// 避免每帧 sws_getContext + av_frame_alloc 的开销（软解兜底路径的卡顿源）。
+	const auto format = (AVPixelFormat)frame->format;
+	if (!sws || swsWidth != frame->width || swsHeight != frame->height || swsFormat != format)
+	{
+		if (sws) sws_freeContext(sws);
+		if (swsOutput) av_frame_free(&swsOutput);
+		sws = sws_getContext(frame->width, frame->height, format, frame->width, frame->height, AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr, nullptr, nullptr);
+		swsOutput = av_frame_alloc();
+		swsOutput->format = AV_PIX_FMT_RGBA;
+		swsOutput->width = frame->width;
+		swsOutput->height = frame->height;
+		av_frame_get_buffer(swsOutput, 1);
+		swsWidth = frame->width;
+		swsHeight = frame->height;
+		swsFormat = format;
+	}
+	if (!sws || !swsOutput) return;
+	sws_scale(sws, frame->data, frame->linesize, 0, frame->height, swsOutput->data, swsOutput->linesize);
 	glBindTexture(GL_TEXTURE_2D, hw_texture);
 	if (!init) {
 		init = true;
-		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, rgba->width, rgba->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, swsOutput->width, swsOutput->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
 	}
-	glPixelStorei(GL_UNPACK_ROW_LENGTH, frame->linesize[0]);
+	// ROW_LENGTH 单位为像素，RGBA 每像素 4 字节。
+	glPixelStorei(GL_UNPACK_ROW_LENGTH, swsOutput->linesize[0] / 4);
 	glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
 	glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
-	glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, rgba->width, rgba->height, GL_RGBA, GL_UNSIGNED_BYTE, rgba->data[0]);
-	av_frame_free(&rgba);
+	glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, swsOutput->width, swsOutput->height, GL_RGBA, GL_UNSIGNED_BYTE, swsOutput->data[0]);
 }
 
 void VideoFrame::UpdateD3D11(const AVFrame* frame)
@@ -64,17 +60,25 @@ void VideoFrame::UpdateD3D11(const AVFrame* frame)
 	auto index = (int64_t)frame->data[1];
 	D3D11_TEXTURE2D_DESC desc;
 	tex->GetDesc(&desc);
-	ComPtr<ID3D11ShaderResourceView> s1, s2;
-	D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
-	srvDesc.Format = DXGI_FORMAT_R8_UNORM;
-	srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
-	srvDesc.Texture2DArray.MipLevels = 1;
-	srvDesc.Texture2DArray.ArraySize = 1;
-	srvDesc.Texture2DArray.FirstArraySlice = index;
-	D3D11Device->CreateShaderResourceView(tex, &srvDesc, &s1);
-	srvDesc.Format = DXGI_FORMAT_R8G8_UNORM;
-	D3D11Device->CreateShaderResourceView(tex, &srvDesc, &s2);
-	ID3D11ShaderResourceView* srvs[] = { s1.Get(),s2.Get() };
+	// 解码器帧池的纹理是共享 array texture，不同帧通过 slice（frame->data[1]）区分。
+	// SRV 绑定在（纹理, slice）上，两者都变化时才重建，避免每帧 CreateShaderResourceView 的开销。
+	if (cachedD3D11Tex != tex || cachedD3D11Slice != index)
+	{
+		cachedD3D11Tex = tex;
+		cachedD3D11Slice = index;
+		srv1 = nullptr;
+		srv2 = nullptr;
+		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+		srvDesc.Format = DXGI_FORMAT_R8_UNORM;
+		srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+		srvDesc.Texture2DArray.MipLevels = 1;
+		srvDesc.Texture2DArray.ArraySize = 1;
+		srvDesc.Texture2DArray.FirstArraySlice = (UINT)index;
+		D3D11Device->CreateShaderResourceView(tex, &srvDesc, &srv1);
+		srvDesc.Format = DXGI_FORMAT_R8G8_UNORM;
+		D3D11Device->CreateShaderResourceView(tex, &srvDesc, &srv2);
+	}
+	ID3D11ShaderResourceView* srvs[] = { srv1.Get(), srv2.Get() };
 	if (ComputeResult == nullptr)
 	{
 		desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -102,16 +106,8 @@ void VideoFrame::UpdateD3D12(const AVFrame* frame)
 	auto df = (AVD3D12VAFrame*)frame->data[0];
 	auto tex = df->texture;
 	auto td = tex->GetDesc();
-	D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
-	sd.Format = DXGI_FORMAT_R8_UNORM;
-	sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-	sd.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(0, 4, 4, 4);
-	sd.Texture2D.MipLevels = 1;
-	D3D12Device->CreateShaderResourceView(tex, &sd, SRV0.CPUHandle);
-	sd.Format = DXGI_FORMAT_R8G8_UNORM;
-	sd.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(0, 1, 4, 4);
-	sd.Texture2D.PlaneSlice = 1;
-	D3D12Device->CreateShaderResourceView(tex, &sd, SRV1.CPUHandle);
+
+	// 首次创建输出纹理、UAV、共享句柄与 GL 内存对象。
 	if (OutputBuffer == nullptr)
 	{
 		D3D12_HEAP_PROPERTIES prop{};
@@ -134,47 +130,78 @@ void VideoFrame::UpdateD3D12(const AVFrame* frame)
 		glCreateMemoryObjectsEXT(1, &memory);
 		glImportMemoryWin32HandleEXT(memory, 0, GL_HANDLE_TYPE_D3D12_RESOURCE_EXT, SharedHandle);
 		glTextureStorageMem2DEXT(hw_texture, 1, GL_RGBA8, td.Width, td.Height, memory, 0);
-		CommandList->SetComputeRootSignature(RootSignature.Get());
-		CommandList->SetDescriptorHeaps(1, DescriptorHeap.GetAddressOf());
-		CommandList->SetComputeRootDescriptorTable(0, DescriptorHeap->GetGPUDescriptorHandleForHeapStart());
-		CommandList->Dispatch(ceil(td.Width / 32.f), ceil(td.Height / 32.f), 1);
-		CommandList->Close();
 	}
+
+	// 对上一帧 GPU 工作做有限等待（4ms），超时则丢弃本帧保留旧画面，
+	// 避免渲染线程无限期阻塞等待 GPU compute，这是 D3D12 路径掉帧的主要来源。
+	// 等待成功后，当前纹理必然是完整写好的画面，因此不会出现撕裂。
+	if (FenceValue > fence->GetCompletedValue())
+	{
+		if (FAILED(fence->SetEventOnCompletion(FenceValue, FenceEvent)) || WaitForSingleObject(FenceEvent, 4) != WAIT_OBJECT_0)
+			return;
+	}
+
+	// 每帧重建 SRV 描述符，指向解码器最新的纹理（解码纹理可能逐帧轮换）。
+	D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+	sd.Format = DXGI_FORMAT_R8_UNORM;
+	sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+	sd.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(0, 4, 4, 4);
+	sd.Texture2D.MipLevels = 1;
+	D3D12Device->CreateShaderResourceView(tex, &sd, SRV0.CPUHandle);
+	sd.Format = DXGI_FORMAT_R8G8_UNORM;
+	sd.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(0, 1, 4, 4);
+	sd.Texture2D.PlaneSlice = 1;
+	D3D12Device->CreateShaderResourceView(tex, &sd, SRV1.CPUHandle);
+
+	// 每帧重新录制命令列表。
+	CommandAllocator->Reset();
+	CommandList->Reset(CommandAllocator.Get(), PSO.Get());
+	CommandList->SetComputeRootSignature(RootSignature.Get());
+	CommandList->SetDescriptorHeaps(1, DescriptorHeap.GetAddressOf());
+	CommandList->SetComputeRootDescriptorTable(0, DescriptorHeap->GetGPUDescriptorHandleForHeapStart());
+	CommandList->Dispatch(ceil(td.Width / 32.f), ceil(td.Height / 32.f), 1);
+	CommandList->Close();
+
 	CommandQueue->Wait(df->sync_ctx.fence, df->sync_ctx.fence_value);
 	CommandQueue->ExecuteCommandLists(1, (ID3D12CommandList**)CommandList.GetAddressOf());
 	CommandQueue->Signal(fence.Get(), ++FenceValue);
-	SyncFence(fence.Get(), FenceValue, FenceEvent);
 }
 
 void VideoFrame::UpdateCUDA(const AVFrame* frame)
 {
-	void* InitCUDA(void* array);
+	void* CreateCUDAArraySurface(const void* array);
+	int DestroyCUDAArraySurface(void* surface);
 	int RunCUDACompute(void* y, void* uv, void* output, void* stream, uint32_t width, uint32_t height, uint32_t stepY, uint32_t stepUV);
 	if (!cuda || !cu_ctx) return;
 	CUcontext previous{};
 	if (cuda->cuCtxPushCurrent(cu_ctx) != CUDA_SUCCESS) return;
 	bool mapped = false;
 	CUarray array{};
-	void* surface = nullptr;
 	if (!cu_res) {
 		glBindTexture(GL_TEXTURE_2D, hw_texture);
 		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, frame->width, frame->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
 		if (cuda->cuGraphicsGLRegisterImage(&cu_res, hw_texture, GL_TEXTURE_2D, CU_GRAPHICS_REGISTER_FLAGS_SURFACE_LDST) != CUDA_SUCCESS) goto cleanup;
 	}
+	// surface 对象按帧尺寸缓存复用，仅当分辨率变化时重建，避免每帧创建/销毁的驱动开销。
+	if (!cu_surface || cu_surface_width != frame->width || cu_surface_height != frame->height)
+	{
+		if (cuda->cuGraphicsSubResourceGetMappedArray(&array, cu_res, 0, 0) != CUDA_SUCCESS) goto cleanup;
+		if (cu_surface) DestroyCUDAArraySurface(cu_surface);
+		cu_surface = CreateCUDAArraySurface(array);
+		if (!cu_surface) goto cleanup;
+		cu_surface_width = frame->width;
+		cu_surface_height = frame->height;
+	}
 	if (cuda->cuGraphicsMapResources(1, &cu_res, stream) != CUDA_SUCCESS) goto cleanup;
 	mapped = true;
-	if (cuda->cuGraphicsSubResourceGetMappedArray(&array, cu_res, 0, 0) != CUDA_SUCCESS) goto cleanup;
-	surface = InitCUDA(array);
-	if (!surface) goto cleanup;
-	if (RunCUDACompute(frame->data[0], frame->data[1], surface, stream, frame->width, frame->height, frame->linesize[0], frame->linesize[1]) != 0) goto cleanup;
+	if (RunCUDACompute(frame->data[0], frame->data[1], cu_surface, stream, frame->width, frame->height, frame->linesize[0], frame->linesize[1]) != 0) goto cleanup;
 
 cleanup:
-	if (surface) cudaDestroySurfaceObject(surface);
 	if (mapped) cuda->cuGraphicsUnmapResources(1, &cu_res, stream);
 	cuda->cuCtxPopCurrent(&previous);
 }
 
-VideoFrame::VideoFrame(const AVHWDeviceType type, const AVHWDeviceContext* hwctx, GLuint tex) : FenceEvent(nullptr), SharedHandle(nullptr), memory(0), FenceValue(0), DXNVDevice(nullptr), TextureObject(nullptr), cuda(nullptr), cu_ctx(nullptr), stream(nullptr), cu_res(nullptr), hw_texture(tex), hwtype(type), hwaccel(false), init(false)
+VideoFrame::VideoFrame(const AVHWDeviceType type, const AVHWDeviceContext* hwctx, GLuint tex) : FenceEvent(nullptr), DXNVDevice(nullptr), TextureObject(nullptr), cuda(nullptr), cu_ctx(nullptr), stream(nullptr), cu_res(nullptr), cu_surface(nullptr), hw_texture(tex), hwtype(type), hwaccel(false), init(false)
 {
 	switch (type)
 	{
@@ -253,7 +280,22 @@ VideoFrame::~VideoFrame()
 	{
 		glDeleteMemoryObjectsEXT(1, &memory);
 		CloseHandle(SharedHandle);
-		CloseHandle(FenceEvent);
+	}
+	if (FenceEvent) CloseHandle(FenceEvent);
+	if (sws) sws_freeContext(sws);
+	if (swsOutput) av_frame_free(&swsOutput);
+	// CUDA surface 对象引用 GL 纹理的 mapped array，必须在注销 GL 互操作资源前销毁。
+	if (cu_surface)
+	{
+		extern int DestroyCUDAArraySurface(void*);
+		if (cuda && cu_ctx) {
+			CUcontext previous{};
+			if (cuda->cuCtxPushCurrent(cu_ctx) == CUDA_SUCCESS) {
+				DestroyCUDAArraySurface(cu_surface);
+				cuda->cuCtxPopCurrent(&previous);
+			}
+		}
+		cu_surface = nullptr;
 	}
 	if (cu_res)
 	{
