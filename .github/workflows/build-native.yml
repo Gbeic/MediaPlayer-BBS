@@ -27,12 +27,29 @@ jobs:
         with:
           arch: x64
 
+      - name: 恢复 CUDA Toolkit 缓存
+        id: cuda-cache
+        uses: actions/cache@v4
+        with:
+          # CUDA 网络安装器的固定安装目录；缓存命中时跳过 5 分钟的网络安装。
+          path: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9
+          key: cuda-12.9-toolkit-${{ runner.os }}
+
       - name: 安装 CUDA Toolkit
+        if: steps.cuda-cache.outputs.cache-hit != 'true'
         uses: Jimver/cuda-toolkit@v0.2.35
         with:
           cuda: '12.9.1'
           method: network
-          sub-packages: '["nvcc", "cudart", "visual_studio_integration"]'
+          # 命令行构建只需要 nvcc 与 cudart，visual_studio_integration 只服务 VS IDE，无需安装。
+          sub-packages: '["nvcc", "cudart"]'
+
+      - name: 配置 CUDA Toolkit 环境变量（缓存命中）
+        if: steps.cuda-cache.outputs.cache-hit == 'true'
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: '12.9.1'
+          method: 'keep'
 
       - name: 恢复 vcpkg 静态依赖缓存
         id: vcpkg-cache
